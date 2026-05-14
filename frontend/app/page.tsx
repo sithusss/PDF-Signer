@@ -1,5 +1,6 @@
 "use client";
 import React, { useRef, useState, useEffect, useCallback } from "react";
+import type { PDFDocumentProxy, PageViewport, RenderTask } from "pdfjs-dist";
 import SignatureCanvas from "react-signature-canvas";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -16,6 +17,15 @@ interface ClickMarker {
   pdfX: number;    // PDF coordinate (points)
   pdfY: number;
   pageIndex: number;
+}
+
+interface SignatureRow {
+  stage: number;
+  employeeId: string;
+  name: string;
+  position: string;
+  userId: string;
+  signatureData?: string;
 }
 
 interface PdfHistoryEntry {
@@ -48,19 +58,18 @@ export default function Home() {
   // Inline signature modal (Sign Now popup)
   const inlineSigCanvas = useRef<React.ElementRef<typeof SignatureCanvas> | null>(null);
   const [showSignModal, setShowSignModal] = useState(false);
-  const [inlineSignatureData, setInlineSignatureData] = useState<string | null>(null); // base64, in-memory only
 
   // PDF rendering
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
   const [pdfLoaded, setPdfLoaded] = useState(false);
   const [loadingPdf, setLoadingPdf] = useState(false);
-  const pdfDocRef = useRef<any>(null);
-  const renderTaskRef = useRef<any>(null);
+  const pdfDocRef = useRef<PDFDocumentProxy | null>(null);
+  const renderTaskRef = useRef<RenderTask | null>(null);
   const [scale, setScale] = useState(1.5);
   const [currentPage, setCurrentPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
-  const viewportRef = useRef<any>(null);
+  const viewportRef = useRef<PageViewport | null>(null);
 
   // Click-to-sign state
   const [marker, setMarker] = useState<ClickMarker | null>(null);
@@ -68,6 +77,7 @@ export default function Home() {
   const [signedPdfUrl, setSignedPdfUrl] = useState<string | null>(null);
   const prevPdfBytesRef = useRef<PdfHistoryEntry[]>([]);
   const [undoCount, setUndoCount] = useState(0);
+  const [signatureRows, setSignatureRows] = useState<SignatureRow[]>([]);
 
   // Tabs
   const [tab, setTab] = useState<"sign" | "review">("sign");
@@ -129,12 +139,12 @@ export default function Home() {
     canvas.width = viewport.width;
     canvas.height = viewport.height;
 
-    const renderTask = page.render({ canvasContext: ctx, viewport });
+    const renderTask = page.render({ canvasContext: ctx, canvas, viewport });
     renderTaskRef.current = renderTask;
     try {
       await renderTask.promise;
-    } catch (e: any) {
-      if (e?.name !== "RenderingCancelledException") console.error(e);
+    } catch (err: unknown) {
+      if (!(err instanceof Error) || err.name !== "RenderingCancelledException") console.error(err);
     }
   }, [scale]);
 
@@ -143,6 +153,7 @@ export default function Home() {
     if (signedPdfUrl) URL.revokeObjectURL(signedPdfUrl);
     prevPdfBytesRef.current = [];
     setUndoCount(0);
+    setSignatureRows([]);
     setLoadingPdf(true);
     setMarker(null);
     setSignedPdfUrl(null);
@@ -212,20 +223,41 @@ export default function Home() {
     setSigning(true);
     setMarker(null);
     try {
+      const markerSnapshot = marker;
       const previousBytes = await getCurrentPdfBytes();
       const res = await fetch(`${API}/add-signature`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           userId: selectedUserId,
-          pdfX: marker.pdfX,
-          pdfY: marker.pdfY,
-          pageIndex: marker.pageIndex,
+          pdfX: markerSnapshot.pdfX,
+          pdfY: markerSnapshot.pdfY,
+          pageIndex: markerSnapshot.pageIndex,
         }),
       });
       if (res.ok) {
         prevPdfBytesRef.current.push({ bytes: previousBytes, hadSignedPdf: Boolean(signedPdfUrl) });
         setUndoCount((count) => count + 1);
+        if (selectedUser) {
+        setSignatureRows((rows) => {
+          const exists = rows.some(
+            (r) => r.employeeId === selectedUser.employeeid
+          );
+
+          if (exists) return rows;
+
+          return [
+            ...rows,
+            {
+              stage: selectedUser.stage,
+              employeeId: selectedUser.employeeid,
+              name: selectedUser.name,
+              position: selectedUser.position,
+              userId: selectedUser.employeeid,
+            },
+          ];
+        });
+        }
 
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
@@ -267,6 +299,19 @@ export default function Home() {
       if (res.ok) {
         prevPdfBytesRef.current.push({ bytes: previousBytes, hadSignedPdf: Boolean(signedPdfUrl) });
         setUndoCount((count) => count + 1);
+        if (selectedUser) {
+          setSignatureRows((rows) => [
+            ...rows,
+            {
+              stage: selectedUser.stage,
+              employeeId: selectedUser.employeeid,
+              name: selectedUser.name,
+              position: selectedUser.position,
+              userId: selectedUser.employeeid,
+              signatureData: signatureBase64,
+            },
+          ]);
+        }
 
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
@@ -305,7 +350,6 @@ export default function Home() {
     if (!marker) return;
 
     const signatureBase64 = pad.getTrimmedCanvas().toDataURL("image/png");
-    setInlineSignatureData(signatureBase64); // keep in memory if needed later
     setShowSignModal(false);
 
     // Place it immediately at the marker coordinates
@@ -351,6 +395,8 @@ export default function Home() {
       const blob = await fetch(signedPdfUrl).then((r) => r.blob());
       const formData = new FormData();
       formData.append("file", blob, "signed_document.pdf");
+      formData.append("userId", selectedUserId);
+      formData.append("signatureRows", JSON.stringify(signatureRows));
 
       const res = await fetch(`${API}/save-signed-pdf`, { method: "POST", body: formData });
       if (res.ok) {
@@ -361,6 +407,12 @@ export default function Home() {
         setMarker(null);
         prevPdfBytesRef.current = [];
         setUndoCount(0);
+        setSignatureRows([]);
+        
+        // Auto-reload the updated PDF to show the refreshed summary table
+        setTimeout(() => {
+          handleReviewPdf();
+        }, 300);
       } else {
         alert("Error saving document: " + await res.text());
       }
@@ -398,6 +450,7 @@ export default function Home() {
       } else {
         setSignedPdfUrl(null);
       }
+      setSignatureRows((rows) => rows.slice(0, -1));
 
       setUndoCount((count) => Math.max(0, count - 1));
     } catch (err) {
@@ -526,6 +579,7 @@ export default function Home() {
                 setSignedPdfUrl(null);
                 prevPdfBytesRef.current = [];
                 setUndoCount(0);
+                setSignatureRows([]);
               }}
             >
               {users.map((u) => (

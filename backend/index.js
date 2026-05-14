@@ -1,5 +1,5 @@
 const express = require('express');
-const { PDFDocument } = require('pdf-lib');
+const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
 const fs = require('fs');
 const path = require('path');
 const cors = require('cors');
@@ -15,6 +15,12 @@ app.use(express.json({ limit: '50mb' }));
 // Directory to store saved signatures
 const SIGNATURES_DIR = path.join(__dirname, 'signatures');
 if (!fs.existsSync(SIGNATURES_DIR)) fs.mkdirSync(SIGNATURES_DIR);
+const SIGNATURE_LOG_PATH = path.join(__dirname, 'signature-log.json');
+
+fs.writeFileSync(SIGNATURE_LOG_PATH, JSON.stringify([], null, 2));
+
+const A4_PAGE_WIDTH = 595.28;
+const A4_PAGE_HEIGHT = 841.89;
 
 // Multer setup for file uploads
 const upload = multer({ storage: multer.memoryStorage() });
@@ -59,6 +65,181 @@ app.get('/preview-pdf', (req, res) => {
   res.contentType('application/pdf');
   res.send(fs.readFileSync(templatePath));
 });
+
+async function appendSignatureSummaryPage(pdfDoc, signatureRows) {
+  const rows = Array.isArray(signatureRows) ? signatureRows : [];
+  const pageWidth = A4_PAGE_WIDTH;
+  const pageHeight = A4_PAGE_HEIGHT;
+  const margin = 36;
+  const titleFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+  const bodyFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const headers = ['Stage', 'Employee ID', 'Name', 'Position', 'Signature'];
+  const contentWidth = pageWidth - margin * 2;
+  const colWidths = [50, 90, 140, 160, contentWidth - (50 + 90 + 140 + 160)];
+  const headerHeight = 30;
+  const tableTop = pageHeight - 140;
+  const tableBottom = margin + 36;
+  const availableHeight = Math.max(120, tableTop - tableBottom - headerHeight);
+  const rowHeight = rows.length > 0 ? Math.max(18, Math.floor(availableHeight / rows.length)) : 48;
+  const page = pdfDoc.addPage([pageWidth, pageHeight]);
+
+  page.drawText('Signature Summary', {
+    x: margin,
+    y: pageHeight - 54,
+    size: 20,
+    font: titleFont,
+    color: rgb(0.12, 0.18, 0.31),
+  });
+
+  page.drawText('Each signature placement is recorded in the same table below.', {
+    x: margin,
+    y: pageHeight - 76,
+    size: 10,
+    font: bodyFont,
+    color: rgb(0.42, 0.45, 0.52),
+  });
+
+  if (rows.length === 0) {
+    page.drawText('No signatures were captured before saving.', {
+      x: margin,
+      y: tableTop - 20,
+      size: 11,
+      font: bodyFont,
+      color: rgb(0.18, 0.22, 0.28),
+    });
+    return;
+  }
+
+  let x = margin;
+  for (let index = 0; index < headers.length; index += 1) {
+    page.drawRectangle({
+      x,
+      y: tableTop - headerHeight,
+      width: colWidths[index],
+      height: headerHeight,
+      borderColor: rgb(0.78, 0.82, 0.88),
+      borderWidth: 1,
+      color: rgb(0.93, 0.95, 0.98),
+    });
+    page.drawText(headers[index], {
+      x: x + 6,
+      y: tableTop - 20,
+      size: 10,
+      font: bodyFont,
+      color: rgb(0.16, 0.2, 0.27),
+    });
+    x += colWidths[index];
+  }
+
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+    const row = rows[rowIndex];
+    const rowTop = tableTop - headerHeight - (rowIndex * rowHeight);
+    const cellTop = rowTop - rowHeight;
+    const rowValues = [String(row.stage ?? ''), row.employeeId ?? row.userId ?? '', row.name ?? '', row.position ?? ''];
+
+    x = margin;
+    for (let index = 0; index < rowValues.length; index += 1) {
+      page.drawRectangle({
+        x,
+        y: cellTop,
+        width: colWidths[index],
+        height: rowHeight,
+        borderColor: rgb(0.78, 0.82, 0.88),
+        borderWidth: 1,
+        color: rgb(1, 1, 1),
+      });
+
+      page.drawText(rowValues[index], {
+        x: x + 6,
+        y: cellTop + rowHeight / 2 - 5,
+        size: 10,
+        font: bodyFont,
+        color: rgb(0.12, 0.15, 0.2),
+        maxWidth: colWidths[index] - 12,
+      });
+
+      x += colWidths[index];
+    }
+
+    page.drawRectangle({
+      x,
+      y: cellTop,
+      width: colWidths[4],
+      height: rowHeight,
+      borderColor: rgb(0.78, 0.82, 0.88),
+      borderWidth: 1,
+      color: rgb(1, 1, 1),
+    });
+
+    const signatureBytes = resolveSignatureBytes(row.employeeId ?? row.userId, row.signatureData);
+    if (signatureBytes) {
+      const signatureImage = await pdfDoc.embedPng(signatureBytes);
+      const signatureHeight = Math.max(16, Math.min(34, rowHeight - 10));
+      page.drawImage(signatureImage, {
+        x: x + 6,
+        y: cellTop + Math.max(4, (rowHeight - signatureHeight) / 2),
+        width: Math.min(colWidths[4] - 12, 110),
+        height: signatureHeight,
+      });
+    } else {
+      page.drawText('Missing signature', {
+        x: x + 6,
+        y: cellTop + rowHeight / 2 - 5,
+        size: 9,
+        font: bodyFont,
+        color: rgb(0.6, 0.1, 0.1),
+      });
+    }
+  }
+}
+
+function resolveSignatureBytes(userId, signatureData) {
+  if (signatureData) {
+    const base64 = signatureData.replace(/^data:image\/png;base64,/, '');
+    return Buffer.from(base64, 'base64');
+  }
+
+  const sigPath = path.join(SIGNATURES_DIR, `${userId}.png`);
+  if (fs.existsSync(sigPath)) {
+    return fs.readFileSync(sigPath);
+  }
+
+  return null;
+}
+
+function readSignatureLog() {
+  if (!fs.existsSync(SIGNATURE_LOG_PATH)) {
+    console.log('📄 Signature log file does not exist yet at:', SIGNATURE_LOG_PATH);
+    return [];
+  }
+  try {
+    const raw = fs.readFileSync(SIGNATURE_LOG_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    console.log('📖 Read signature log:', {
+      path: SIGNATURE_LOG_PATH,
+      exists: true,
+      rowCount: Array.isArray(parsed) ? parsed.length : 0,
+      employeeIds: Array.isArray(parsed) ? parsed.map(r => r.employeeId || r.userId) : 'invalid'
+    });
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (err) {
+    console.error('❌ Error reading signature log:', err.message);
+    return [];
+  }
+}
+
+function writeSignatureLog(rows) {
+  try {
+    fs.writeFileSync(SIGNATURE_LOG_PATH, JSON.stringify(rows, null, 2));
+    console.log('✅ Wrote signature log:', {
+      path: SIGNATURE_LOG_PATH,
+      rowCount: rows.length,
+      employeeIds: rows.map(r => r.employeeId || r.userId)
+    });
+  } catch (err) {
+    console.error('❌ Error writing signature log:', err.message);
+  }
+}
 
 // ── POST /analyze-pdf ────────────────────────────────────────────────────────
 app.post('/analyze-pdf', async (req, res) => {
@@ -185,15 +366,32 @@ app.post('/add-signature-inline', async (req, res) => {
 });
 
 // ── POST /save-signed-pdf ───────────────────────────────────────────────────
-app.post('/save-signed-pdf', upload.single('file'), (req, res) => {
+app.post('/save-signed-pdf', upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
   const previewPath = path.join(__dirname, 'preview.pdf');
 
   try {
-    fs.writeFileSync(previewPath, req.file.buffer);
+    const pdfDoc = await PDFDocument.load(req.file.buffer);
+    const incomingRows = req.body.signatureRows
+      ? JSON.parse(req.body.signatureRows)
+      : [];
+    const existingRows = readSignatureLog();
+    const mergedRows = [...existingRows, ...incomingRows];
+
+    // Only replace the previous summary page when one already exists.
+    if (existingRows.length > 0 && pdfDoc.getPageCount() > 0) {
+      pdfDoc.removePage(pdfDoc.getPageCount() - 1);
+    }
+
+    writeSignatureLog(mergedRows);
+    await appendSignatureSummaryPage(pdfDoc, mergedRows);
+
+    const finalPdfBytes = await pdfDoc.save();
+    fs.writeFileSync(previewPath, Buffer.from(finalPdfBytes));
+
     res.json({
       success: true,
-      message: 'Document saved and overwritten successfully.'
+      message: 'Document saved, signature summary page added, and PDF overwritten successfully.'
     });
   } catch (err) {
     console.error(err);
